@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# face-sequence-aligner
+output/
+*.mp4
+*.tmp.mp4
+img/**
