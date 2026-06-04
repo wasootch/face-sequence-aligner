@@ -357,18 +357,22 @@ class App(ctk.CTk):
         )
 
     def _export_progress(self, current: int, total: int):
-        self.after(0, self._progress.set, current / total)
-        self.after(0, self._set_status, f"Exporting frame {current}/{total}…")
+        ratio = current / total
+        msg = f"Exporting frame {current}/{total}…"
+        self.after(0, lambda: (self._progress.set(ratio), self._set_status(msg)))
 
     def _export_done(self, error: Optional[Exception]):
-        if error:
-            self.after(0, messagebox.showerror, "Export failed", str(error))
-            self.after(0, self._set_status, "Export failed.")
-        else:
-            self.after(0, self._set_status, "Export complete!")
-            self.after(0, self._progress.set, 1.0)
-        self.after(0, self._export_btn.configure, {"state": "normal"})
-        self.after(0, self._align_btn.configure, {"state": "normal"})
+        def _on_main_thread():
+            if error:
+                messagebox.showerror("Export failed", str(error))
+                self._set_status("Export failed.")
+            else:
+                self._set_status("Export complete!")
+                self._progress.set(1.0)
+            self._export_btn.configure(state="normal")
+            self._align_btn.configure(state="normal")
+
+        self.after(0, _on_main_thread)
 
     def _on_thumbnail_select(self, idx: int):
         frame = self._aligned_frames[idx]
