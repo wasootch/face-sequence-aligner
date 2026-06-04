@@ -82,6 +82,16 @@ class FacePickerDialog(ctk.CTkToplevel):
         cancel_btn.pack(pady=(0, 10))
 
         self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        # Centre on the parent window once layout is calculated
+        self.withdraw()
+        self.update_idletasks()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        dw, dh = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.geometry(f"+{px + (pw - dw) // 2}+{py + (ph - dh) // 2}")
+        self.deiconify()
+
         self.wait_window()
 
     # ------------------------------------------------------------------

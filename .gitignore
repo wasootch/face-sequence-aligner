@@ -222,3 +222,11 @@ output/
 *.mp4
 *.tmp.mp4
 img/**
+
+# Music tracks (royalty-free audio added by the user — not committed to the repo)
+music/*.mp3
+music/*.wav
+music/*.ogg
+music/*.flac
+music/*.m4a
+music/*.aac

@@ -11,12 +11,13 @@ A desktop app that turns a folder of face photos into a smooth MP4 timelapse. Or
 - **Context-aware zoom** - the output scale is derived from the median "fit-to-frame" face size across all photos, so the video shows as much surrounding context as possible while keeping faces at a consistent size; adjustable via the **Face %** field
 - **Sort order** - photos are ordered by EXIF date (falling back to file date); can be switched to filename ascending/descending or date descending
 - **Thumbnail preview** - a scrollable strip of aligned thumbnails lets you review alignment before exporting
+- **Music / audio** - optional audio track mixed into the exported video; choose from royalty-free tracks in the `music/` folder or browse for any file; audio loops automatically and fades out at the end
 - **MP4 export** - configurable hold duration, cross-fade transition length, and FPS; re-encodes to H.264 via ffmpeg if available
 
 ## Requirements
 
 - Python 3.11+
-- ffmpeg on `PATH` (optional - improves MP4 compatibility; falls back to mp4v if absent)
+- ffmpeg on `PATH` (optional - required for H.264 output and audio mixing; falls back to mp4v with no audio if absent)
 
 Install Python dependencies:
 
@@ -33,7 +34,7 @@ python main.py
 1. Click **Open Folder…** and select a directory of photos (JPEG, PNG, TIFF, BMP, WebP)
 2. Choose a **Sort** order - default is EXIF date ascending (oldest first), falling back to file date when EXIF is absent
 3. Set the output **Resolution**, **Hold**, **Transition**, **FPS**, and optionally a **Face %** (see below)
-4. Click **Align Photos** - faces are detected and aligned; multi-face photos prompt a picker dialog
+4. Click **Align Photos** - faces are detected and aligned; multi-face photos prompt a picker dialog. Click the face or select with button.
 5. Review the thumbnail strip; click a thumbnail to see its filename
 6. Click **Export MP4…**, choose a save location, and wait for encoding to complete
 
@@ -47,13 +48,14 @@ python main.py
 | **FPS** | Frames per second of the output MP4. |
 | **Face %** | Inter-eye distance as a percentage of the frame width. Lower values zoom out, showing more surrounding context; higher values zoom in. Leave blank to auto-compute from the dataset. |
 | **Sort** | `Date ↑` (default) - EXIF date ascending, file date fallback. Also available: `Date ↓`, `Filename ↑`, `Filename ↓`. |
+| **Audio** | Select a track from the `music/` folder, or click **Browse…** to use any file. Set to `None` for a silent video. Requires ffmpeg. |
 
 ## Changing settings without re-aligning
 
-- **Hold, Transition, FPS** - change freely; just click **Export MP4…** again with the same aligned frames.
+- **Hold, Transition, FPS, Audio** - change freely; just click **Export MP4…** again with the same aligned frames.
 - **Face %** - change and click **Align Photos** again; detection is cached so only the warp step re-runs (fast).
 - **Sort** - change and click **Align Photos** again; detection cache is reused, only the order and warp step re-run.
-- **Resolution** - changing thisrequires a full re-align; the **Export** button is disabled automatically when the dropdown doesn't match the aligned frames.
+- **Resolution** - requires a full re-align; the **Export** button is disabled automatically when the dropdown doesn't match the aligned frames.
 
 ## Project structure
 
@@ -65,6 +67,7 @@ ui/
   app.py          - main window
   face_picker.py  - multi-face selection dialog
   preview.py      - scrollable thumbnail strip widget
+music/            - drop royalty-free audio files here; see music/README.md for sources
 requirements.txt
 diagnose.py       - CLI tool for debugging face detection on a folder of images
 ```
@@ -83,3 +86,4 @@ This reports, for each image, the resolution, whether EXIF rotation was applied,
 
 - The MediaPipe face landmarker model (~30 MB) is downloaded automatically to `~/.cache/face-sequence-aligner/` on first run
 - Face detection caches per folder - switching sort order or Face % re-uses cached detections and skips straight to warping
+- Audio files in `music/` are gitignored; only the folder's `README.md` is tracked. See `music/README.md` for royalty-free sources

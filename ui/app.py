@@ -9,6 +9,7 @@ Layout (top → bottom):
 
 from __future__ import annotations
 
+import subprocess
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +24,21 @@ from exporter import export_mp4_async
 from ui.preview import PreviewStrip
 from ui.face_picker import pick_face
 
-_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+_IMAGE_EXTS  = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+_AUDIO_EXTS  = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac"}
+_MUSIC_DIR   = Path(__file__).parent.parent / "music"
+_NO_AUDIO    = "None"
+
+
+def _scan_music() -> dict[str, Path]:
+    """Return {filename: path} for audio files in the music/ folder, sorted by name."""
+    if not _MUSIC_DIR.exists():
+        return {}
+    return {
+        p.name: p
+        for p in sorted(_MUSIC_DIR.iterdir())
+        if p.suffix.lower() in _AUDIO_EXTS
+    }
 
 _SORT_OPTIONS = ["Date ↑", "Date ↓", "Filename ↑", "Filename ↓"]
 
@@ -97,6 +112,10 @@ class App(ctk.CTk):
         # Resolution the current _aligned_frames were rendered at.
         self._aligned_output_size: Optional[tuple[int, int]] = None
 
+        # Audio: maps dropdown label → Path; None means no audio.
+        self._audio_tracks: dict[str, Path] = {}
+        self._audio_player: Optional["subprocess.Popen"] = None
+
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -156,7 +175,7 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(r1, text="Resolution:").grid(row=0, column=col, padx=(0, 2))
         col += 1
-        self._res_var = ctk.StringVar(value="1080×1080")
+        self._res_var = ctk.StringVar(value="1920×1080")
         self._res_var.trace_add("write", lambda *_: self._on_resolution_changed())
         ctk.CTkOptionMenu(
             r1, variable=self._res_var, values=list(_RESOLUTIONS.keys()), width=120
@@ -202,6 +221,36 @@ class App(ctk.CTk):
             r1, text="Export MP4…", command=self._start_export, width=120, state="disabled"
         )
         self._export_btn.grid(row=0, column=col)
+
+        # --- Row 2: audio (separate frame so its columns don't affect row 1) ---
+        r2 = ctk.CTkFrame(parent, fg_color="transparent")
+        r2.grid(row=2, column=0, columnspan=99, sticky="w", padx=10, pady=(0, 8))
+
+        ctk.CTkLabel(r2, text="Audio:").grid(row=0, column=0, padx=(0, 4))
+
+        self._audio_tracks = _scan_music()
+        audio_options = [_NO_AUDIO] + list(self._audio_tracks.keys())
+        self._audio_var = ctk.StringVar(value=_NO_AUDIO)
+        self._audio_var.trace_add("write", lambda *_: self._on_audio_track_changed())
+        self._audio_menu = ctk.CTkOptionMenu(
+            r2, variable=self._audio_var, values=audio_options, width=220,
+        )
+        self._audio_menu.grid(row=0, column=1, padx=(0, 8))
+
+        self._audio_duration_label = ctk.CTkLabel(r2, text="", width=44, anchor="w", text_color="gray")
+        self._audio_duration_label.grid(row=0, column=2, padx=(0, 6))
+
+        self._audio_play_btn = ctk.CTkButton(
+            r2, text="▶  Play", command=self._toggle_audio_playback, width=85, state="disabled"
+        )
+        self._audio_play_btn.grid(row=0, column=3, padx=(0, 8))
+
+        ctk.CTkButton(
+            r2, text="Browse…", command=self._browse_audio, width=80
+        ).grid(row=0, column=4, padx=(0, 10))
+
+        self._audio_custom_label = ctk.CTkLabel(r2, text="", anchor="w", text_color="gray")
+        self._audio_custom_label.grid(row=0, column=5, sticky="w")
 
     def _build_status_bar(self, parent: ctk.CTkFrame):
         parent.grid_columnconfigure(0, weight=1)
@@ -442,6 +491,15 @@ class App(ctk.CTk):
         self._set_status("Exporting…")
         self._progress.set(0)
 
+        audio = self._selected_audio_path
+        if audio and not __import__("shutil").which("ffmpeg"):
+            messagebox.showwarning(
+                "ffmpeg not found",
+                "Audio mixing requires ffmpeg on your PATH.\n"
+                "The video will be exported without audio.",
+            )
+            audio = None
+
         self._export_thread = export_mp4_async(
             frames=self._aligned_frames,
             output_path=Path(out_path),
@@ -450,6 +508,7 @@ class App(ctk.CTk):
             transition_seconds=trans,
             progress_callback=self._export_progress,
             done_callback=self._export_done,
+            audio_path=audio,
         )
 
     def _export_progress(self, current: int, total: int):
@@ -493,6 +552,100 @@ class App(ctk.CTk):
 
         self._preview.set_frames(self._aligned_frames)
 
+    def _browse_audio(self):
+        path = filedialog.askopenfilename(
+            title="Select audio file",
+            filetypes=[
+                ("Audio files", "*.mp3 *.wav *.ogg *.flac *.m4a *.aac"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        p = Path(path)
+        label = f"Custom: {p.name}"
+        self._audio_tracks[label] = p
+        options = [_NO_AUDIO] + list(self._audio_tracks.keys())
+        self._audio_menu.configure(values=options)
+        self._audio_var.set(label)           # triggers _on_audio_track_changed
+        self._audio_custom_label.configure(text=str(p.parent))
+
+    def _on_audio_track_changed(self):
+        self._stop_audio()
+        path = self._selected_audio_path
+        if path and path.exists():
+            dur = self._get_audio_duration(path)
+            self._audio_duration_label.configure(text=dur)
+            self._audio_play_btn.configure(state="normal")
+        else:
+            self._audio_duration_label.configure(text="")
+            self._audio_play_btn.configure(state="disabled")
+
+    def _toggle_audio_playback(self):
+        if self._audio_player is not None:
+            self._stop_audio()
+        else:
+            self._start_audio()
+
+    def _start_audio(self):
+        path = self._selected_audio_path
+        if not path or not path.exists():
+            return
+        import shutil
+        if not shutil.which("ffplay"):
+            messagebox.showwarning("ffplay not found",
+                                   "Audio preview requires ffplay (installed with ffmpeg).")
+            return
+        self._audio_player = subprocess.Popen(
+            ["ffplay", "-nodisp", "-autoexit", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._audio_play_btn.configure(text="■  Stop")
+        threading.Thread(target=self._monitor_playback,
+                         args=(self._audio_player,), daemon=True).start()
+
+    def _stop_audio(self):
+        if self._audio_player is not None:
+            self._audio_player.terminate()
+            self._audio_player = None
+        self._audio_play_btn.configure(text="▶  Play")
+
+    def _monitor_playback(self, proc: subprocess.Popen):
+        """Background thread — resets the button when ffplay finishes naturally."""
+        proc.wait()
+        self.after(0, self._on_playback_ended, proc)
+
+    def _on_playback_ended(self, proc: subprocess.Popen):
+        if self._audio_player is proc:   # only reset if still the active player
+            self._audio_player = None
+            self._audio_play_btn.configure(text="▶  Play")
+
+    @staticmethod
+    def _get_audio_duration(path: Path) -> str:
+        """Return duration as 'm:ss' using ffprobe, or empty string on failure."""
+        import shutil
+        if not shutil.which("ffprobe"):
+            return ""
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "quiet",
+                 "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1",
+                 str(path)],
+                capture_output=True, text=True, timeout=5,
+            )
+            secs = float(result.stdout.strip())
+            m, s = divmod(int(secs), 60)
+            return f"{m}:{s:02d}"
+        except Exception:
+            return ""
+
+    @property
+    def _selected_audio_path(self) -> Optional[Path]:
+        choice = self._audio_var.get()
+        return self._audio_tracks.get(choice)  # None for "None" or unknown key
+
     def _on_resolution_changed(self):
         selected = _RESOLUTIONS.get(self._res_var.get(), (1080, 1080))
         if self._aligned_output_size and selected != self._aligned_output_size:
@@ -506,6 +659,7 @@ class App(ctk.CTk):
         self._status_label.configure(text=msg)
 
     def on_close(self):
+        self._stop_audio()
         if self._aligner:
             self._aligner.close()
         self.destroy()
