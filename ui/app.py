@@ -2,7 +2,7 @@
 Main application window.
 
 Layout (top → bottom):
-  Toolbar   — folder picker, output resolution, hold/transition controls, Export button
+  Toolbar   — folder picker (row 0), settings + action buttons (row 1)
   Preview   — aligned-frame thumbnail strip
   Status    — progress bar + status label
 """
@@ -47,6 +47,14 @@ class App(ctk.CTk):
         self._aligner: Optional[FaceAligner] = None
         self._export_thread: Optional[threading.Thread] = None
 
+        # Cached face detections — reused when only Face % changes so the
+        # slow detection step can be skipped on subsequent Align runs.
+        self._pending_faces: list[tuple[Path, object]] = []
+        self._detected_folder: Optional[Path] = None
+
+        # Resolution the current _aligned_frames were rendered at.
+        self._aligned_output_size: Optional[tuple[int, int]] = None
+
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -57,37 +65,28 @@ class App(ctk.CTk):
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
-        # --- Toolbar ---
         toolbar = ctk.CTkFrame(self, corner_radius=0)
         toolbar.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
         self._build_toolbar(toolbar)
 
-        # --- Preview strip (scrollable) ---
         preview_frame = ctk.CTkFrame(self)
         preview_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(10, 0))
         preview_frame.grid_rowconfigure(0, weight=1)
         preview_frame.grid_columnconfigure(0, weight=1)
 
-        self._preview = PreviewStrip(
-            preview_frame,
-            on_select=self._on_thumbnail_select,
-        )
+        self._preview = PreviewStrip(preview_frame, on_select=self._on_thumbnail_select)
         self._preview.grid(row=0, column=0, sticky="nsew")
 
-        # Enlarged selected-frame view
         self._detail_label = ctk.CTkLabel(preview_frame, text="")
         self._detail_label.grid(row=1, column=0, pady=4)
 
-        # --- Status bar ---
         status_bar = ctk.CTkFrame(self, corner_radius=0, height=48)
         status_bar.grid(row=2, column=0, sticky="ew", padx=0, pady=0)
         status_bar.grid_propagate(False)
         self._build_status_bar(status_bar)
 
     def _build_toolbar(self, parent: ctk.CTkFrame):
-        # Row 0: folder picker
-        # Row 1: settings + action buttons
-        parent.grid_columnconfigure(1, weight=1)   # folder label stretches
+        parent.grid_columnconfigure(1, weight=1)
 
         # --- Row 0: folder ---
         ctk.CTkButton(
@@ -95,8 +94,8 @@ class App(ctk.CTk):
         ).grid(row=0, column=0, padx=(10, 6), pady=(8, 2), sticky="w")
 
         self._folder_label = ctk.CTkLabel(parent, text="No folder selected", anchor="w")
-        self._folder_label.grid(row=0, column=1, padx=(0, 10), pady=(8, 2), sticky="ew",
-                                columnspan=99)
+        self._folder_label.grid(row=0, column=1, padx=(0, 10), pady=(8, 2),
+                                sticky="ew", columnspan=99)
 
         # --- Row 1: settings ---
         r1 = ctk.CTkFrame(parent, fg_color="transparent")
@@ -107,6 +106,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(r1, text="Resolution:").grid(row=0, column=col, padx=(0, 2))
         col += 1
         self._res_var = ctk.StringVar(value="1080×1080")
+        self._res_var.trace_add("write", lambda *_: self._on_resolution_changed())
         ctk.CTkOptionMenu(
             r1, variable=self._res_var, values=list(_RESOLUTIONS.keys()), width=120
         ).grid(row=0, column=col, padx=(0, 16))
@@ -130,7 +130,14 @@ class App(ctk.CTk):
         ctk.CTkEntry(r1, textvariable=self._fps_var, width=44).grid(row=0, column=col, padx=(0, 16))
         col += 1
 
-        # Spacer
+        ctk.CTkLabel(r1, text="Face %:").grid(row=0, column=col, padx=(0, 2))
+        col += 1
+        self._face_pct_var = ctk.StringVar(value="")
+        ctk.CTkEntry(
+            r1, textvariable=self._face_pct_var, width=52, placeholder_text="auto"
+        ).grid(row=0, column=col, padx=(0, 16))
+        col += 1
+
         r1.grid_columnconfigure(col, weight=1)
         col += 1
 
@@ -168,6 +175,10 @@ class App(ctk.CTk):
         self._aligned_frames.clear()
         self._preview.clear()
         self._export_btn.configure(state="disabled")
+        # Invalidate cached detections — new folder means new images.
+        self._pending_faces.clear()
+        self._detected_folder = None
+        self._face_pct_var.set("")
         self._set_status("Folder selected. Click 'Align Photos' to process.")
 
     def _start_align(self):
@@ -186,100 +197,113 @@ class App(ctk.CTk):
         res_key = self._res_var.get()
         output_size = _RESOLUTIONS.get(res_key, (1080, 1080))
 
+        # If we have cached detections for this folder, skip Phase 1 (detection)
+        # and only re-run the warp.  This makes changing Face % very fast.
+        can_skip_detection = (
+            bool(self._pending_faces) and self._detected_folder == self._folder
+        )
+
         self._align_btn.configure(state="disabled")
         self._export_btn.configure(state="disabled")
         self._aligned_frames.clear()
         self._preview.clear()
-        self._set_status(f"Aligning {len(images)} photos…")
         self._progress.set(0)
 
-        # Run alignment on a background thread to keep UI responsive
+        if can_skip_detection:
+            self._set_status("Re-aligning with new face size (skipping detection)…")
+        else:
+            self._set_status(f"Detecting faces in {len(images)} photo(s)…")
+
         threading.Thread(
             target=self._align_worker,
-            args=(images, output_size),
+            args=(images, output_size, can_skip_detection),
             daemon=True,
         ).start()
 
-    def _align_worker(self, images: list[Path], output_size: tuple[int, int]):
+    def _align_worker(
+        self,
+        images: list[Path],
+        output_size: tuple[int, int],
+        skip_detection: bool,
+    ):
         if self._aligner:
             self._aligner.close()
         self._aligner = FaceAligner(output_size=output_size)
 
         skipped = 0
 
-        # --- Phase 1: detect faces in every image ---
-        # Collect (path, chosen_face) pairs; multi-face images pause for UI pick.
-        pending: list[tuple[Path, object]] = []
-        n = len(images)
-        for i, path in enumerate(images):
-            self._set_status(f"Detecting [{i+1}/{n}] {path.name}")
-            self._progress.set((i + 1) / (n * 2))
+        # --- Phase 1: detect faces (skipped when only Face % changed) ---
+        if skip_detection:
+            pending = self._pending_faces
+        else:
+            pending = []
+            n = len(images)
+            for i, path in enumerate(images):
+                self._set_status(f"Detecting [{i+1}/{n}] {path.name}")
+                self._progress.set((i + 1) / (n * 2))
 
-            try:
-                faces = self._aligner.detect_faces(path)
-            except Exception as exc:
-                self._set_status(f"Error reading {path.name}: {exc}")
-                skipped += 1
-                continue
-
-            if not faces:
-                self._set_status(f"No face found in {path.name} — skipped.")
-                skipped += 1
-                continue
-
-            if len(faces) == 1:
-                chosen = faces[0]
-            else:
-                chosen = self._ask_face_pick(path, faces)
-                if chosen is None:
+                try:
+                    faces = self._aligner.detect_faces(path)
+                except Exception as exc:
+                    self._set_status(f"Error reading {path.name}: {exc}")
                     skipped += 1
                     continue
 
-            pending.append((path, chosen))
+                if not faces:
+                    self._set_status(f"No face found in {path.name} — skipped.")
+                    skipped += 1
+                    continue
+
+                if len(faces) == 1:
+                    chosen = faces[0]
+                else:
+                    chosen = self._ask_face_pick(path, faces)
+                    if chosen is None:
+                        skipped += 1
+                        continue
+
+                pending.append((path, chosen))
+
+            self._pending_faces = pending
+            self._detected_folder = self._folder
 
         if not pending:
-            self.after(0, self._align_done, [], skipped)
+            self.after(0, self._align_done, [], skipped, None)
             return
 
-        # --- Phase 2: compute a data-driven target eye size ---
-        #
-        # For each image, ask: "if this photo were shrunk to fit inside the
-        # output frame without cropping, how many pixels wide would the
-        # inter-eye distance be?"  The median of those values becomes the
-        # shared target for all images.
-        #
-        # Why this works:
-        #   • Per-image natural scale is still used (face sizes are consistent).
-        #   • The target is smaller than the default 30%-of-width, so images
-        #     are zoomed out — showing more context, with black fill where the
-        #     original doesn't reach the edge.
-        #   • Clamped to [10%, 25%] of output width so faces stay legible.
+        # --- Phase 2: determine target eye size ---
         output_w, _ = output_size
-        fit_eye_pxs: list[float] = []
-        for path, face in pending:
-            try:
-                from PIL import Image as _PIL, ImageOps as _IOps
-                with _PIL.open(path) as _img:
-                    _img = _IOps.exif_transpose(_img)
-                    orig_w, orig_h = _img.size
-                fit_eye_pxs.append(self._aligner.eye_px_at_fit(face, orig_w, orig_h))
-            except Exception:
-                pass
 
-        if fit_eye_pxs:
-            raw_target = float(np.median(fit_eye_pxs))
-            # clamp: faces must be between 10% and 25% of output width
-            target_eye_px = float(np.clip(raw_target, 0.10 * output_w, 0.25 * output_w))
-        else:
-            target_eye_px = 0.25 * output_w  # safe fallback
+        # If the user typed a Face % value, use it directly.
+        target_eye_px: Optional[float] = None
+        try:
+            user_pct = float(self._face_pct_var.get())
+            if 1.0 <= user_pct <= 80.0:
+                target_eye_px = user_pct / 100.0 * output_w
+        except ValueError:
+            pass  # empty / "auto" — compute from data below
 
-        pct = round(target_eye_px / output_w * 100, 1)
-        self._set_status(f"Target face size: {pct}% of frame — aligning…")
+        if target_eye_px is None:
+            # Auto: median of how large each face would be at fit-to-frame scale,
+            # clamped so faces stay between 5% and 25% of output width.
+            from PIL import Image as _PIL, ImageOps as _IOps
+            fit_eye_pxs: list[float] = []
+            for path, face in pending:
+                try:
+                    with _PIL.open(path) as _img:
+                        _img = _IOps.exif_transpose(_img)
+                        orig_w, orig_h = _img.size
+                    fit_eye_pxs.append(self._aligner.eye_px_at_fit(face, orig_w, orig_h))
+                except Exception:
+                    pass
+
+            if fit_eye_pxs:
+                raw = float(np.median(fit_eye_pxs))
+                target_eye_px = float(np.clip(raw, 0.05 * output_w, 0.25 * output_w))
+            else:
+                target_eye_px = 0.20 * output_w
 
         # --- Phase 3: warp every image with the shared target ---
-        # Each image uses its own per-image scale so that the inter-eye
-        # distance equals target_eye_px in every output frame.  Consistent
-        # face size across frames is what makes the video look aligned.
         results: list[AlignedFrame] = []
         m = len(pending)
         for j, (path, face) in enumerate(pending):
@@ -292,10 +316,10 @@ class App(ctk.CTk):
                 self._set_status(f"Align error {path.name}: {exc}")
                 skipped += 1
 
-        self.after(0, self._align_done, results, skipped)
+        self.after(0, self._align_done, results, skipped,
+                   target_eye_px / output_w * 100, output_size)
 
     def _ask_face_pick(self, path: Path, faces) -> Optional[object]:
-        """Block the worker thread until the user picks a face in the dialog."""
         result_holder = [None]
         event = threading.Event()
 
@@ -307,19 +331,36 @@ class App(ctk.CTk):
         event.wait()
         return result_holder[0]
 
-    def _align_done(self, results: list[AlignedFrame], skipped: int):
+    def _align_done(
+        self,
+        results: list[AlignedFrame],
+        skipped: int,
+        used_face_pct: Optional[float],
+        output_size: Optional[tuple[int, int]] = None,
+    ):
         self._aligned_frames = results
+        self._aligned_output_size = output_size
         self._preview.set_frames(results)
         self._align_btn.configure(state="normal")
+
+        if used_face_pct is not None:
+            # Show the value that was actually used so the user can adjust it.
+            self._face_pct_var.set(f"{used_face_pct:.1f}")
 
         msg = f"Aligned {len(results)} photo(s)."
         if skipped:
             msg += f" {skipped} skipped."
+        if used_face_pct is not None:
+            msg += f"  Face size: {used_face_pct:.1f}%"
         self._set_status(msg)
         self._progress.set(1.0)
 
         if results:
             self._export_btn.configure(state="normal")
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
 
     def _start_export(self):
         if not self._aligned_frames:
@@ -374,11 +415,20 @@ class App(ctk.CTk):
 
         self.after(0, _on_main_thread)
 
+    # ------------------------------------------------------------------
+
     def _on_thumbnail_select(self, idx: int):
         frame = self._aligned_frames[idx]
         self._detail_label.configure(text=frame.source_path.name)
 
-    # ------------------------------------------------------------------
+    def _on_resolution_changed(self):
+        selected = _RESOLUTIONS.get(self._res_var.get(), (1080, 1080))
+        if self._aligned_output_size and selected != self._aligned_output_size:
+            self._export_btn.configure(state="disabled")
+            self._set_status(
+                f"Resolution changed to {selected[0]}×{selected[1]} — "
+                "click 'Align Photos' to update frames before exporting."
+            )
 
     def _set_status(self, msg: str):
         self._status_label.configure(text=msg)
