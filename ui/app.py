@@ -10,6 +10,7 @@ Layout (top → bottom):
 from __future__ import annotations
 
 import threading
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Optional
@@ -24,9 +25,50 @@ from ui.face_picker import pick_face
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
+_SORT_OPTIONS = ["Date ↑", "Date ↓", "Filename ↑", "Filename ↓"]
+
+_EXIF_DATE_TAGS = (36867, 306)   # DateTimeOriginal, DateTime
+
+
+def _photo_date(path: Path) -> datetime:
+    """Return the best available date for sorting: EXIF → file mtime."""
+    try:
+        from PIL import Image as _PIL
+        with _PIL.open(path) as img:
+            exif = img._getexif()
+            if exif:
+                for tag_id in _EXIF_DATE_TAGS:
+                    val = exif.get(tag_id)
+                    if val:
+                        try:
+                            return datetime.strptime(val, "%Y:%m:%d %H:%M:%S")
+                        except ValueError:
+                            pass
+    except Exception:
+        pass
+    return datetime.fromtimestamp(path.stat().st_mtime)
+
+
+def _sort_images(images: list[Path], sort_option: str) -> list[Path]:
+    desc = "↓" in sort_option
+    if "Date" in sort_option:
+        return sorted(images, key=_photo_date, reverse=desc)
+    return sorted(images, key=lambda p: p.name.lower(), reverse=desc)
+
+
+def _sort_images_keyed(
+    pairs: list[tuple[Path, object]], sort_option: str
+) -> list[tuple[Path, object]]:
+    """Sort (path, face) pairs using the same key as _sort_images."""
+    desc = "↓" in sort_option
+    if "Date" in sort_option:
+        return sorted(pairs, key=lambda t: _photo_date(t[0]), reverse=desc)
+    return sorted(pairs, key=lambda t: t[0].name.lower(), reverse=desc)
+
+
 _RESOLUTIONS = {
-    "1080×1080": (1080, 1080),
     "1920×1080": (1920, 1080),
+    "1080×1080": (1080, 1080),
     "720×720": (720, 720),
     "640×640": (640, 640),
 }
@@ -74,7 +116,11 @@ class App(ctk.CTk):
         preview_frame.grid_rowconfigure(0, weight=1)
         preview_frame.grid_columnconfigure(0, weight=1)
 
-        self._preview = PreviewStrip(preview_frame, on_select=self._on_thumbnail_select)
+        self._preview = PreviewStrip(
+            preview_frame,
+            on_select=self._on_thumbnail_select,
+            on_reorder=self._on_thumbnail_reorder,
+        )
         self._preview.grid(row=0, column=0, sticky="nsew")
 
         self._detail_label = ctk.CTkLabel(preview_frame, text="")
@@ -86,16 +132,21 @@ class App(ctk.CTk):
         self._build_status_bar(status_bar)
 
     def _build_toolbar(self, parent: ctk.CTkFrame):
-        parent.grid_columnconfigure(1, weight=1)
+        parent.grid_columnconfigure(1, weight=1)  # folder label stretches
 
-        # --- Row 0: folder ---
+        # --- Row 0: folder + sort ---
         ctk.CTkButton(
             parent, text="Open Folder…", command=self._pick_folder, width=130
         ).grid(row=0, column=0, padx=(10, 6), pady=(8, 2), sticky="w")
 
         self._folder_label = ctk.CTkLabel(parent, text="No folder selected", anchor="w")
-        self._folder_label.grid(row=0, column=1, padx=(0, 10), pady=(8, 2),
-                                sticky="ew", columnspan=99)
+        self._folder_label.grid(row=0, column=1, padx=(0, 10), pady=(8, 2), sticky="ew")
+
+        ctk.CTkLabel(parent, text="Sort:").grid(row=0, column=2, padx=(0, 4), pady=(8, 2))
+        self._sort_var = ctk.StringVar(value="Date ↑")
+        ctk.CTkOptionMenu(
+            parent, variable=self._sort_var, values=_SORT_OPTIONS, width=130,
+        ).grid(row=0, column=3, padx=(0, 10), pady=(8, 2))
 
         # --- Row 1: settings ---
         r1 = ctk.CTkFrame(parent, fg_color="transparent")
@@ -216,7 +267,7 @@ class App(ctk.CTk):
 
         threading.Thread(
             target=self._align_worker,
-            args=(images, output_size, can_skip_detection),
+            args=(images, output_size, can_skip_detection, self._sort_var.get()),
             daemon=True,
         ).start()
 
@@ -225,6 +276,7 @@ class App(ctk.CTk):
         images: list[Path],
         output_size: tuple[int, int],
         skip_detection: bool,
+        sort_option: str,
     ):
         if self._aligner:
             self._aligner.close()
@@ -270,6 +322,9 @@ class App(ctk.CTk):
         if not pending:
             self.after(0, self._align_done, [], skipped, None)
             return
+
+        # Sort a copy so the cached _pending_faces order is never mutated.
+        pending = _sort_images_keyed(pending, sort_option)
 
         # --- Phase 2: determine target eye size ---
         output_w, _ = output_size
@@ -420,6 +475,23 @@ class App(ctk.CTk):
     def _on_thumbnail_select(self, idx: int):
         frame = self._aligned_frames[idx]
         self._detail_label.configure(text=frame.source_path.name)
+
+    def _on_thumbnail_reorder(self, old_idx: int, new_idx: int):
+        # Move the aligned frame
+        frame = self._aligned_frames.pop(old_idx)
+        self._aligned_frames.insert(new_idx, frame)
+
+        # Keep _pending_faces in the same order so that re-aligning
+        # (e.g. to change Face %) preserves the user's manual ordering.
+        if len(self._pending_faces) == len(self._aligned_frames):
+            path_to_pair = {path: face for path, face in self._pending_faces}
+            self._pending_faces = [
+                (f.source_path, path_to_pair[f.source_path])
+                for f in self._aligned_frames
+                if f.source_path in path_to_pair
+            ]
+
+        self._preview.set_frames(self._aligned_frames)
 
     def _on_resolution_changed(self):
         selected = _RESOLUTIONS.get(self._res_var.get(), (1080, 1080))
