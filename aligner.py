@@ -118,17 +118,38 @@ class FaceAligner:
     def detect_faces(self, image_path: Path) -> list[Face]:
         return self._detect_in_bgr(_load_bgr(image_path))
 
-    def align(self, image_path: Path, face: Face) -> AlignedFrame:
+    def eye_px_at_fit(self, face: Face, orig_w: int, orig_h: int) -> float:
+        """
+        Inter-eye pixel distance in the OUTPUT frame if the whole source image
+        were fit inside the output (letterbox/fill scale).  Used to compute a
+        data-driven target that shows as much of each image as possible.
+        """
+        import math
+        d = math.hypot(
+            face.right_eye[0] - face.left_eye[0],
+            face.right_eye[1] - face.left_eye[1],
+        )
+        fit_scale = min(self.output_w / orig_w, self.output_h / orig_h)
+        return d * fit_scale
+
+    def align(self, image_path: Path, face: Face, target_eye_px: float | None = None) -> AlignedFrame:
+        """
+        Align image so the face's eyes are horizontal and centred.
+        target_eye_px: desired inter-eye distance in output pixels.
+          None  → use the hardcoded 30%-of-width default.
+          value → lets the worker pass a batch-derived target (same for all
+                  images), keeping face sizes consistent while showing more context.
+        """
         bgr = _load_bgr(image_path)
-        aligned, matrix = self._affine_warp(bgr, face)
+        aligned, matrix = self._affine_warp(bgr, face, target_eye_px=target_eye_px)
         return AlignedFrame(source_path=image_path, image=aligned, face=face, transform=matrix)
 
-    def detect_and_align(self, image_path: Path) -> list[AlignedFrame]:
+    def detect_and_align(self, image_path: Path, target_eye_px: float | None = None) -> list[AlignedFrame]:
         bgr = _load_bgr(image_path)
         faces = self._detect_in_bgr(bgr)
         results = []
         for f in faces:
-            warped, matrix = self._affine_warp(bgr, f)
+            warped, matrix = self._affine_warp(bgr, f, target_eye_px=target_eye_px)
             results.append(AlignedFrame(source_path=image_path, image=warped, face=f, transform=matrix))
         return results
 
@@ -263,31 +284,44 @@ class FaceAligner:
         x1, y1 = int(max(xs)), int(max(ys))
         return (x0, y0, x1 - x0, y1 - y0)
 
-    def _affine_warp(self, bgr: np.ndarray, face: Face) -> tuple[np.ndarray, np.ndarray]:
+    def _affine_warp(
+        self, bgr: np.ndarray, face: Face, target_eye_px: float | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        import math
+
         lx, ly = face.left_eye
         rx, ry = face.right_eye
 
-        tlx = _EYE_LEFT_X  * self.output_w
-        trx = _EYE_RIGHT_X * self.output_w
-        ty  = _EYE_Y       * self.output_h
+        angle = math.atan2(ry - ly, rx - lx)
 
-        src_pts = np.float32([
-            [lx, ly],
-            [rx, ry],
-            [lx + (ry - ly), ly - (rx - lx)],
-        ])
-        dst_pts = np.float32([
-            [tlx, ty],
-            [trx, ty],
-            [tlx, ty - (trx - tlx)],
+        d = math.hypot(rx - lx, ry - ly)
+        target_d = target_eye_px if target_eye_px is not None else (_EYE_RIGHT_X - _EYE_LEFT_X) * self.output_w
+        scale = target_d / d if d > 0 else 1.0
+
+        # Source eye centre → target eye centre in the output frame
+        cx_src = (lx + rx) / 2
+        cy_src = (ly + ry) / 2
+        cx_dst = 0.5 * self.output_w
+        cy_dst = _EYE_Y * self.output_h
+
+        # Build a 2×3 similarity matrix:
+        #   rotate by -angle, scale, then translate so eye centre lands on target.
+        cos_a = math.cos(-angle)
+        sin_a = math.sin(-angle)
+        tx = cx_dst - scale * (cos_a * cx_src - sin_a * cy_src)
+        ty = cy_dst - scale * (sin_a * cx_src + cos_a * cy_src)
+
+        matrix = np.float32([
+            [scale * cos_a, -scale * sin_a, tx],
+            [scale * sin_a,  scale * cos_a, ty],
         ])
 
-        matrix = cv2.getAffineTransform(src_pts, dst_pts)
         warped = cv2.warpAffine(
             bgr, matrix,
             (self.output_w, self.output_h),
             flags=cv2.INTER_LANCZOS4,
-            borderMode=cv2.BORDER_REPLICATE,
+            borderMode=cv2.BORDER_CONSTANT,   # black where image doesn't cover frame
+            borderValue=(0, 0, 0),
         )
         return warped, matrix
 
