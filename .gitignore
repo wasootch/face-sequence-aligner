@@ -217,6 +217,12 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# face-sequence-aligner build artefacts
+build/
+dist/
+*.zip
+*.spec.bak
+
 # face-sequence-aligner
 output/
 *.mp4
