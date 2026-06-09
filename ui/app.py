@@ -509,18 +509,31 @@ class App(ctk.CTk):
             progress_callback=self._export_progress,
             done_callback=self._export_done,
             audio_path=audio,
+            status_callback=self._export_status,
         )
 
     def _export_progress(self, current: int, total: int):
-        ratio = current / total
         msg = f"Exporting frame {current}/{total}…"
-        self.after(0, lambda: (self._progress.set(ratio), self._set_status(msg)))
+        def _update():
+            if current == total:
+                self._progress.configure(mode="indeterminate")
+                self._progress.start()
+            else:
+                self._progress.set(current / total)
+            self._set_status(msg)
+        self.after(0, _update)
+
+    def _export_status(self, msg: str):
+        self.after(0, lambda: self._set_status(msg))
 
     def _export_done(self, error: Optional[Exception]):
         def _on_main_thread():
+            self._progress.stop()
+            self._progress.configure(mode="determinate")
             if error:
                 messagebox.showerror("Export failed", str(error))
                 self._set_status("Export failed.")
+                self._progress.set(0)
             else:
                 self._set_status("Export complete!")
                 self._progress.set(1.0)

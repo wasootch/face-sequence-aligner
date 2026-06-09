@@ -61,11 +61,13 @@ def export_mp4(
     transition_seconds: float = 1.0,
     progress_callback: Optional[Callable[[int, int], None]] = None,
     audio_path: Optional[Path] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
 ) -> None:
     """
     Encode aligned frames to an MP4 file.
 
     progress_callback(current, total) is called on the encoding thread.
+    status_callback(message) is called for post-processing steps (ffmpeg).
     audio_path: optional audio file to mix in (requires ffmpeg).
     Raises on failure.
     """
@@ -74,6 +76,10 @@ def export_mp4(
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Clean up any stale tmp file from a previous failed export.
+    tmp_path = output_path.with_suffix(".tmp.mp4")
+    tmp_path.unlink(missing_ok=True)
 
     frame_seq = build_frame_sequence(frames, fps, hold_seconds, transition_seconds)
     total     = len(frame_seq)
@@ -96,8 +102,12 @@ def export_mp4(
     # Pass 1 – re-encode mp4v → H.264 for broad player compatibility.
     # Pass 2 – copy the H.264 stream and mix in audio (no re-encode of video).
     video_duration = total / fps
+    if status_callback:
+        status_callback("Re-encoding to H.264…")
     _try_reencode_h264(output_path)
     if audio_path and Path(audio_path).exists():
+        if status_callback:
+            status_callback("Mixing audio…")
         _mix_audio(output_path, Path(audio_path), video_duration)
 
 
@@ -183,6 +193,7 @@ def export_mp4_async(
     progress_callback: Optional[Callable[[int, int], None]] = None,
     done_callback: Optional[Callable[[Optional[Exception]], None]] = None,
     audio_path: Optional[Path] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
 ) -> threading.Thread:
     """Run export_mp4 on a background thread; returns the Thread."""
 
@@ -190,7 +201,7 @@ def export_mp4_async(
         try:
             export_mp4(
                 frames, output_path, fps, hold_seconds,
-                transition_seconds, progress_callback, audio_path,
+                transition_seconds, progress_callback, audio_path, status_callback,
             )
             if done_callback:
                 done_callback(None)
