@@ -9,17 +9,23 @@ Layout (top → bottom):
 
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
+import tkinter as tk
 from typing import Optional
 
 import numpy as np
 import customtkinter as ctk
 
-from aligner import AlignedFrame, FaceAligner
+from aligner import AlignedFrame, Face, FaceAligner
+try:
+    from version import __version__ as _APP_VERSION
+except ImportError:
+    _APP_VERSION = "unknown"
 from exporter import export_mp4_async
 from ui.preview import PreviewStrip
 from ui.face_picker import pick_face
@@ -89,6 +95,97 @@ _RESOLUTIONS = {
 }
 
 
+class _PopupMenu:
+    """
+    Custom styled popup menu that matches the app's dark theme.
+    tk.Menu ignores bg/fg on Windows 11, so we build our own.
+    """
+    _W          = 220   # fixed menu width
+    _BG         = "#2b2b2b"
+    _BORDER     = "#555555"
+    _FG         = "#dce4ee"
+    _FG_DIM     = "#666666"
+    _HOVER_BG   = "#1f538d"
+    _SEP_COLOR  = "#444444"
+
+    def __init__(self, parent: ctk.CTk):
+        self._parent = parent
+        self._items: list[tuple] = []
+
+    def add_command(self, label: str, command, accelerator: str = ""):
+        self._items.append(("cmd", label, command, accelerator))
+
+    def add_separator(self):
+        self._items.append(("sep",))
+
+    def show(self, x: int, y: int):
+        popup = tk.Toplevel(self._parent)
+        popup.withdraw()
+        popup.overrideredirect(True)
+        popup.configure(bg=self._BORDER)
+
+        inner = tk.Frame(popup, bg=self._BG)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        closed = [False]
+
+        def close(cmd=None):
+            if closed[0]:
+                return
+            closed[0] = True
+            try:
+                popup.destroy()
+            except tk.TclError:
+                pass
+            if cmd:
+                self._parent.after(0, cmd)
+
+        for item in self._items:
+            if item[0] == "sep":
+                tk.Frame(inner, height=1, bg=self._SEP_COLOR).pack(
+                    fill="x", padx=8, pady=3
+                )
+            else:
+                _, label, command, accel = item
+                row = tk.Frame(inner, bg=self._BG, cursor="hand2")
+                row.pack(fill="x")
+                lbl = tk.Label(
+                    row, text=label, bg=self._BG, fg=self._FG,
+                    font=("Segoe UI", 13), anchor="w", padx=12, pady=5,
+                )
+                lbl.pack(side="left", fill="both", expand=True)
+                widgets = [row, lbl]
+                if accel:
+                    ak = tk.Label(
+                        row, text=accel, bg=self._BG, fg=self._FG_DIM,
+                        font=("Segoe UI", 13), anchor="e", padx=12,
+                    )
+                    ak.pack(side="right")
+                    widgets.append(ak)
+
+                def _bind(ws, cmd):
+                    bg, hbg = self._BG, self._HOVER_BG
+                    for w in ws:
+                        w.bind("<Enter>", lambda e, _ws=ws: [_w.configure(bg=hbg) for _w in _ws])
+                        w.bind("<Leave>", lambda e, _ws=ws: [_w.configure(bg=bg)  for _w in _ws])
+                        w.bind("<Button-1>", lambda e, _c=cmd: close(_c))
+
+                _bind(widgets, command)
+
+        # Delay FocusOut binding so the popup has time to fully appear
+        popup.after(150, lambda: popup.bind("<FocusOut>", lambda e: close()))
+        popup.bind("<Escape>", lambda e: close())
+
+        popup.update_idletasks()
+        h = popup.winfo_reqheight()
+        sw = popup.winfo_screenwidth()
+        sh = popup.winfo_screenheight()
+        popup.geometry(f"{self._W}x{h}+{min(x, sw - self._W)}+{min(y, sh - h)}")
+        popup.deiconify()
+        popup.lift()
+        popup.focus_force()
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -116,22 +213,279 @@ class App(ctk.CTk):
         self._audio_tracks: dict[str, Path] = {}
         self._audio_player: Optional["subprocess.Popen"] = None
 
+        self._project_path: Optional[Path] = None
+
+        self._build_menu()
         self._build_ui()
+        self.bind("<Control-n>", lambda _: self._new_project())
+        self.bind("<Control-o>", lambda _: self._open_project())
+        self.bind("<Control-s>", lambda _: self._save_project())
+
+    # ------------------------------------------------------------------
+    # Menu bar
+    # ------------------------------------------------------------------
+
+    def _build_menu(self):
+        bar = ctk.CTkFrame(self, corner_radius=0, height=30, fg_color=("#e0e0e0", "#1a1a1a"))
+        bar.grid(row=0, column=0, sticky="ew")
+        bar.grid_propagate(False)
+
+        file_menu = _PopupMenu(self)
+        file_menu.add_command("New",              self._new_project,     "Ctrl+N")
+        file_menu.add_separator()
+        file_menu.add_command("Open Project…",    self._open_project,    "Ctrl+O")
+        file_menu.add_separator()
+        file_menu.add_command("Save Project",     self._save_project,    "Ctrl+S")
+        file_menu.add_command("Save Project As…", self._save_project_as)
+        file_menu.add_separator()
+        file_menu.add_command("Exit", self.on_close)
+
+        help_menu = _PopupMenu(self)
+        help_menu.add_command("About", self._show_about)
+
+        for label, menu in (("File", file_menu), ("Help", help_menu)):
+            self._add_menu_button(bar, label, menu)
+
+    def _add_menu_button(self, bar: ctk.CTkFrame, label: str, menu: _PopupMenu):
+        btn = ctk.CTkButton(
+            bar, text=label, width=52, height=26,
+            fg_color="transparent",
+            hover_color=("#cccccc", "#2d2d2d"),
+            text_color=("black", "#dce4ee"),
+            corner_radius=0,
+        )
+        btn.configure(command=lambda b=btn, m=menu: m.show(
+            b.winfo_rootx(), b.winfo_rooty() + b.winfo_height()
+        ))
+        btn.pack(side="left", padx=0, pady=2)
+
+    def _show_about(self):
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("About Face Sequence Aligner")
+        dlg.resizable(False, False)
+        dlg.attributes("-toolwindow", True)  # removes minimize/maximize buttons on Windows
+
+        dlg.withdraw()
+        dlg.update_idletasks()
+        w, h = 340, 200
+        x = self.winfo_rootx() + (self.winfo_width()  - w) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - h) // 2
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+        dlg.deiconify()
+
+        ctk.CTkLabel(
+            dlg, text="Face Sequence Aligner",
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).pack(pady=(24, 4))
+        ctk.CTkLabel(dlg, text=f"Version {_APP_VERSION}").pack()
+        ctk.CTkLabel(
+            dlg,
+            text="Creates smooth face-aligned timelapse videos\nfrom a sequence of photos.",
+            wraplength=300,
+        ).pack(pady=(10, 0))
+        ctk.CTkButton(dlg, text="OK", command=dlg.destroy, width=80).pack(pady=(18, 0))
+
+        dlg.grab_set()
+        dlg.wait_window()
+
+    # ------------------------------------------------------------------
+    # Project save / load
+    # ------------------------------------------------------------------
+
+    def _new_project(self):
+        self._project_path = None
+        self._folder = None
+        self._folder_label.configure(text="No folder selected")
+        self._aligned_frames.clear()
+        self._pending_faces.clear()
+        self._detected_folder = None
+        self._aligned_output_size = None
+        self._face_pct_var.set("")
+        self._preview.clear()
+        self._export_btn.configure(state="disabled")
+        self._set_status("Ready.")
+        self._progress.set(0)
+        self._update_title()
+
+    def _open_project(self):
+        path = filedialog.askopenfilename(
+            title="Open Project",
+            filetypes=[("Face Sequence Aligner project", "*.fsa"), ("All files", "*.*")],
+        )
+        if path:
+            self._do_load(Path(path))
+
+    def _save_project(self):
+        if self._project_path:
+            self._do_save(self._project_path)
+        else:
+            self._save_project_as()
+
+    def _save_project_as(self):
+        path = filedialog.asksaveasfilename(
+            title="Save Project",
+            defaultextension=".fsa",
+            filetypes=[("Face Sequence Aligner project", "*.fsa")],
+        )
+        if path:
+            self._project_path = Path(path)
+            self._do_save(self._project_path)
+
+    def _do_save(self, path: Path):
+        audio_choice = self._audio_var.get()
+        audio_path = self._audio_tracks.get(audio_choice)
+
+        data = {
+            "version": 1,
+            "folder": str(self._folder) if self._folder else None,
+            "settings": {
+                "resolution": self._res_var.get(),
+                "hold":       self._hold_var.get(),
+                "transition": self._trans_var.get(),
+                "fps":        self._fps_var.get(),
+                "face_pct":   self._face_pct_var.get(),
+                "sort":       self._sort_var.get(),
+                "audio_path": str(audio_path) if audio_path else None,
+            },
+            "faces": [
+                {
+                    "path": str(p),
+                    "face": {
+                        "index":     f.index,
+                        "bbox":      list(f.bbox),
+                        "left_eye":  list(f.left_eye),
+                        "right_eye": list(f.right_eye),
+                    },
+                }
+                for p, f in self._pending_faces
+            ],
+        }
+        try:
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            self._update_title()
+            self._set_status(f"Project saved: {path.name}")
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+
+    def _do_load(self, path: Path):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            messagebox.showerror("Open failed", f"Could not read project file:\n{exc}")
+            return
+
+        if data.get("version", 1) != 1:
+            messagebox.showwarning("Version mismatch", "This project was saved by a newer version of the app.")
+
+        self._project_path = path
+
+        # Restore folder
+        folder_str = data.get("folder")
+        self._folder = Path(folder_str) if folder_str else None
+        self._folder_label.configure(
+            text=str(self._folder) if self._folder else "No folder selected"
+        )
+
+        # Restore settings
+        s = data.get("settings", {})
+        if s.get("resolution") in _RESOLUTIONS:
+            self._res_var.set(s["resolution"])
+        for var, key in (
+            (self._hold_var,     "hold"),
+            (self._trans_var,    "transition"),
+            (self._fps_var,      "fps"),
+            (self._face_pct_var, "face_pct"),
+        ):
+            if key in s:
+                var.set(s[key])
+        if s.get("sort") in _SORT_OPTIONS:
+            self._sort_var.set(s["sort"])
+
+        # Restore audio
+        audio_path_str = s.get("audio_path")
+        if audio_path_str:
+            ap = Path(audio_path_str)
+            if ap.exists():
+                label = ap.name
+                self._audio_tracks[label] = ap
+                options = [_NO_AUDIO] + list(self._audio_tracks.keys())
+                self._audio_menu.configure(values=options)
+                self._audio_var.set(label)
+            else:
+                self._audio_var.set(_NO_AUDIO)
+        else:
+            self._audio_var.set(_NO_AUDIO)
+
+        # Restore face detections
+        pending: list[tuple[Path, Face]] = []
+        for entry in data.get("faces", []):
+            img_path = Path(entry["path"])
+            if not img_path.exists():
+                continue
+            fd = entry.get("face", {})
+            try:
+                face = Face(
+                    index=fd["index"],
+                    bbox=tuple(fd["bbox"]),
+                    left_eye=tuple(fd["left_eye"]),
+                    right_eye=tuple(fd["right_eye"]),
+                )
+                pending.append((img_path, face))
+            except (KeyError, TypeError):
+                continue
+
+        if not pending:
+            messagebox.showwarning(
+                "No photos loaded",
+                "None of the saved photos could be found. Check that the photo folder is accessible.",
+            )
+            self._update_title()
+            return
+
+        self._update_title()
+        self._start_align_from_project(pending)
+
+    def _start_align_from_project(self, pending: list[tuple[Path, Face]]):
+        """Align using pre-loaded face data (no detection, no re-sort)."""
+        res_key = self._res_var.get()
+        output_size = _RESOLUTIONS.get(res_key, (1080, 1080))
+
+        self._pending_faces = list(pending)
+        self._detected_folder = self._folder
+
+        self._align_btn.configure(state="disabled")
+        self._export_btn.configure(state="disabled")
+        self._aligned_frames.clear()
+        self._preview.clear()
+        self._progress.set(0)
+        self._set_status(f"Loading project — aligning {len(pending)} photo(s)…")
+
+        threading.Thread(
+            target=self._align_worker,
+            args=([], output_size, True, None),   # sort_option=None → preserve order
+            daemon=True,
+        ).start()
+
+    def _update_title(self):
+        if self._project_path:
+            self.title(f"Face Sequence Aligner — {self._project_path.stem}")
+        else:
+            self.title("Face Sequence Aligner")
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(2, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
         toolbar = ctk.CTkFrame(self, corner_radius=0)
-        toolbar.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+        toolbar.grid(row=1, column=0, sticky="ew", padx=0, pady=0)
         self._build_toolbar(toolbar)
 
         preview_frame = ctk.CTkFrame(self)
-        preview_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(10, 0))
+        preview_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=(10, 0))
         preview_frame.grid_rowconfigure(0, weight=1)
         preview_frame.grid_columnconfigure(0, weight=1)
 
@@ -139,6 +493,7 @@ class App(ctk.CTk):
             preview_frame,
             on_select=self._on_thumbnail_select,
             on_reorder=self._on_thumbnail_reorder,
+            on_context=self._on_thumbnail_context,
         )
         self._preview.grid(row=0, column=0, sticky="nsew")
 
@@ -146,7 +501,7 @@ class App(ctk.CTk):
         self._detail_label.grid(row=1, column=0, pady=4)
 
         status_bar = ctk.CTkFrame(self, corner_radius=0, height=48)
-        status_bar.grid(row=2, column=0, sticky="ew", padx=0, pady=0)
+        status_bar.grid(row=3, column=0, sticky="ew", padx=0, pady=0)
         status_bar.grid_propagate(False)
         self._build_status_bar(status_bar)
 
@@ -325,7 +680,7 @@ class App(ctk.CTk):
         images: list[Path],
         output_size: tuple[int, int],
         skip_detection: bool,
-        sort_option: str,
+        sort_option: Optional[str],
     ):
         if self._aligner:
             self._aligner.close()
@@ -373,7 +728,9 @@ class App(ctk.CTk):
             return
 
         # Sort a copy so the cached _pending_faces order is never mutated.
-        pending = _sort_images_keyed(pending, sort_option)
+        # sort_option=None means preserve the existing order (e.g. project load).
+        if sort_option is not None:
+            pending = _sort_images_keyed(pending, sort_option)
 
         # --- Phase 2: determine target eye size ---
         output_w, _ = output_size
@@ -564,6 +921,87 @@ class App(ctk.CTk):
             ]
 
         self._preview.set_frames(self._aligned_frames)
+
+    def _on_thumbnail_context(self, idx: int, x: int, y: int):
+        menu = _PopupMenu(self)
+        menu.add_command("Remove from sequence", lambda: self._remove_frame(idx))
+        menu.add_command("Choose different face…", lambda: self._repick_face(idx))
+        menu.show(x, y)
+
+    def _remove_frame(self, idx: int):
+        if not (0 <= idx < len(self._aligned_frames)):
+            return
+        name = self._aligned_frames[idx].source_path.name
+        self._aligned_frames.pop(idx)
+        if 0 <= idx < len(self._pending_faces):
+            self._pending_faces.pop(idx)
+        self._preview.set_frames(self._aligned_frames)
+        if not self._aligned_frames:
+            self._export_btn.configure(state="disabled")
+        self._set_status(f"Removed {name}. {len(self._aligned_frames)} photo(s) remaining.")
+
+    def _repick_face(self, idx: int):
+        if not (0 <= idx < len(self._aligned_frames)):
+            return
+        path = self._aligned_frames[idx].source_path
+
+        self._align_btn.configure(state="disabled")
+        self._export_btn.configure(state="disabled")
+        self._set_status(f"Detecting faces in {path.name}…")
+
+        def _worker():
+            try:
+                if self._aligner is None:
+                    output_size = _RESOLUTIONS.get(self._res_var.get(), (1080, 1080))
+                    self._aligner = FaceAligner(output_size=output_size)
+
+                faces = self._aligner.detect_faces(path)
+
+                if not faces:
+                    def _no_face():
+                        messagebox.showwarning("No face found", f"No face detected in {path.name}.")
+                        self._align_btn.configure(state="normal")
+                        self._export_btn.configure(state="normal")
+                        self._set_status("Ready.")
+                    self.after(0, _no_face)
+                    return
+
+                chosen = faces[0] if len(faces) == 1 else self._ask_face_pick(path, faces)
+                if chosen is None:
+                    def _cancelled():
+                        self._align_btn.configure(state="normal")
+                        self._export_btn.configure(state="normal")
+                        self._set_status("Re-pick cancelled.")
+                    self.after(0, _cancelled)
+                    return
+
+                output_size = self._aligned_output_size or _RESOLUTIONS.get(self._res_var.get(), (1080, 1080))
+                try:
+                    target_eye_px = float(self._face_pct_var.get()) / 100.0 * output_size[0]
+                except ValueError:
+                    target_eye_px = 0.20 * output_size[0]
+
+                frame = self._aligner.align(path, chosen, target_eye_px=target_eye_px)
+
+                def _done():
+                    self._aligned_frames[idx] = frame
+                    if 0 <= idx < len(self._pending_faces):
+                        self._pending_faces[idx] = (path, chosen)
+                    self._preview.set_frames(self._aligned_frames)
+                    self._align_btn.configure(state="normal")
+                    self._export_btn.configure(state="normal")
+                    self._set_status(f"Re-aligned {path.name}.")
+                self.after(0, _done)
+
+            except Exception as exc:
+                def _err(e=exc):
+                    messagebox.showerror("Re-pick failed", str(e))
+                    self._align_btn.configure(state="normal")
+                    self._export_btn.configure(state="normal")
+                    self._set_status("Re-pick failed.")
+                self.after(0, _err)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _browse_audio(self):
         path = filedialog.askopenfilename(

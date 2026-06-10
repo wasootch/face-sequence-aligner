@@ -30,6 +30,11 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Stamp version from tag
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v', ''
+          Set-Content -Path version.py -Value "__version__ = '$ver'"
+
       - name: Build executable
         run: pyinstaller face-sequence-aligner.spec
 
