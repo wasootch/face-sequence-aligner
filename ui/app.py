@@ -9,9 +9,11 @@ Layout (top → bottom):
 
 from __future__ import annotations
 
+import cv2
 import json
 import subprocess
 import threading
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -214,6 +216,11 @@ class App(ctk.CTk):
         self._audio_player: Optional["subprocess.Popen"] = None
 
         self._project_path: Optional[Path] = None
+        self._last_export_path: Optional[Path] = None
+
+        # Cancellation token for raw-preview background loads.
+        # A new object() is assigned each time a load is started or superseded.
+        self._raw_preview_token: object = object()
 
         self._build_menu()
         self._build_ui()
@@ -302,7 +309,10 @@ class App(ctk.CTk):
         self._aligned_output_size = None
         self._face_pct_var.set("")
         self._preview.clear()
+        self._last_export_path = None
         self._export_btn.configure(state="disabled")
+        self._show_folder_btn.configure(state="disabled")
+        self._video_info_label.configure(text="")
         self._set_status("Ready.")
         self._progress.set(0)
         self._update_title()
@@ -322,10 +332,12 @@ class App(ctk.CTk):
             self._save_project_as()
 
     def _save_project_as(self):
+        default_name = self._folder.name if self._folder else ""
         path = filedialog.asksaveasfilename(
             title="Save Project",
             defaultextension=".fsa",
             filetypes=[("Face Sequence Aligner project", "*.fsa")],
+            initialfile=default_name,
         )
         if path:
             self._project_path = Path(path)
@@ -333,10 +345,25 @@ class App(ctk.CTk):
 
     def _do_save(self, path: Path):
         audio_choice = self._audio_var.get()
-        audio_path = self._audio_tracks.get(audio_choice)
+        audio_path   = self._audio_tracks.get(audio_choice)
+
+        face_entries = [
+            {
+                "path":        str(af.source_path),
+                "frame_index": i,
+                "face_count":  af.face_count,
+                "face": {
+                    "index":     af.face.index,
+                    "bbox":      list(af.face.bbox),
+                    "left_eye":  list(af.face.left_eye),
+                    "right_eye": list(af.face.right_eye),
+                },
+            }
+            for i, af in enumerate(self._aligned_frames)
+        ]
 
         data = {
-            "version": 1,
+            "version": 2,
             "folder": str(self._folder) if self._folder else None,
             "settings": {
                 "resolution": self._res_var.get(),
@@ -347,35 +374,57 @@ class App(ctk.CTk):
                 "sort":       self._sort_var.get(),
                 "audio_path": str(audio_path) if audio_path else None,
             },
-            "faces": [
-                {
-                    "path": str(p),
-                    "face": {
-                        "index":     f.index,
-                        "bbox":      list(f.bbox),
-                        "left_eye":  list(f.left_eye),
-                        "right_eye": list(f.right_eye),
-                    },
-                }
-                for p, f in self._pending_faces
-            ],
+            "faces": face_entries,
         }
-        try:
-            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            self._update_title()
-            self._set_status(f"Project saved: {path.name}")
-        except Exception as exc:
-            messagebox.showerror("Save failed", str(exc))
+
+        # Snapshot frames now so the worker thread has a stable copy.
+        frames_snapshot = list(self._aligned_frames)
+
+        self._set_status("Saving project…")
+        self._progress.configure(mode="indeterminate")
+        self._progress.start()
+
+        def _worker():
+            try:
+                with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                    zf.writestr("project.json", json.dumps(data, indent=2))
+                    for i, frame in enumerate(frames_snapshot):
+                        ok, buf = cv2.imencode(
+                            ".jpg", frame.image,
+                            [cv2.IMWRITE_JPEG_QUALITY, 92],
+                        )
+                        if ok:
+                            zf.writestr(f"frames/{i:04d}.jpg", buf.tobytes())
+
+                def _done():
+                    self._progress.stop()
+                    self._progress.configure(mode="determinate")
+                    self._progress.set(1.0)
+                    self._update_title()
+                    self._set_status(f"Project saved: {path.name}")
+                self.after(0, _done)
+
+            except Exception as exc:
+                def _err(e=exc):
+                    self._progress.stop()
+                    self._progress.configure(mode="determinate")
+                    messagebox.showerror("Save failed", str(e))
+                    self._set_status("Save failed.")
+                self.after(0, _err)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _do_load(self, path: Path):
+        is_zip = zipfile.is_zipfile(str(path))
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            if is_zip:
+                with zipfile.ZipFile(path, "r") as zf:
+                    data = json.loads(zf.read("project.json").decode("utf-8"))
+            else:
+                data = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
             messagebox.showerror("Open failed", f"Could not read project file:\n{exc}")
             return
-
-        if data.get("version", 1) != 1:
-            messagebox.showwarning("Version mismatch", "This project was saved by a newer version of the app.")
 
         self._project_path = path
 
@@ -416,12 +465,11 @@ class App(ctk.CTk):
         else:
             self._audio_var.set(_NO_AUDIO)
 
-        # Restore face detections
-        pending: list[tuple[Path, Face]] = []
-        for entry in data.get("faces", []):
-            img_path = Path(entry["path"])
-            if not img_path.exists():
-                continue
+        # Build face list.
+        # For ZIP projects (v2) photos don't need to exist — frames are embedded.
+        # For plain JSON (v1) the original photos must be present for re-alignment.
+        pending_all: list[tuple[Path, Face, int, int]] = []   # (path, face, frame_index, face_count)
+        for i, entry in enumerate(data.get("faces", [])):
             fd = entry.get("face", {})
             try:
                 face = Face(
@@ -430,20 +478,49 @@ class App(ctk.CTk):
                     left_eye=tuple(fd["left_eye"]),
                     right_eye=tuple(fd["right_eye"]),
                 )
-                pending.append((img_path, face))
             except (KeyError, TypeError):
                 continue
+            img_path    = Path(entry["path"])
+            frame_index = entry.get("frame_index", i)
+            face_count  = entry.get("face_count", 1)
+            pending_all.append((img_path, face, frame_index, face_count))
 
-        if not pending:
-            messagebox.showwarning(
-                "No photos loaded",
-                "None of the saved photos could be found. Check that the photo folder is accessible.",
-            )
+        if not pending_all:
+            messagebox.showwarning("No photos loaded", "The project contains no photo entries.")
             self._update_title()
             return
 
         self._update_title()
-        self._start_align_from_project(pending)
+
+        # ZIP v2 with embedded frames → fast path: load images directly from ZIP.
+        if is_zip and data.get("version", 1) >= 2:
+            with zipfile.ZipFile(path, "r") as zf:
+                zip_names = set(zf.namelist())
+            has_frames = any(
+                f"frames/{fi:04d}.jpg" in zip_names
+                for _, _, fi, _ in pending_all
+            )
+            if has_frames:
+                output_size = _RESOLUTIONS.get(self._res_var.get(), (1080, 1080))
+                try:
+                    used_face_pct: Optional[float] = float(self._face_pct_var.get())
+                except ValueError:
+                    used_face_pct = None
+                self._start_load_from_zip(path, pending_all, output_size, used_face_pct)
+                return
+
+        # Fallback: re-align from source photos (v1 format or ZIP without frames).
+        pending_existing = [
+            (p, f) for p, f, _, _ in pending_all if p.exists()
+        ]
+        if not pending_existing:
+            messagebox.showwarning(
+                "No photos found",
+                "None of the saved photos could be found on disk.\n"
+                "Check that the photo folder is still accessible.",
+            )
+            return
+        self._start_align_from_project(pending_existing)
 
     def _start_align_from_project(self, pending: list[tuple[Path, Face]]):
         """Align using pre-loaded face data (no detection, no re-sort)."""
@@ -457,7 +534,8 @@ class App(ctk.CTk):
         self._export_btn.configure(state="disabled")
         self._aligned_frames.clear()
         self._preview.clear()
-        self._progress.set(0)
+        self._progress.configure(mode="indeterminate")
+        self._progress.start()
         self._set_status(f"Loading project — aligning {len(pending)} photo(s)…")
 
         threading.Thread(
@@ -465,6 +543,77 @@ class App(ctk.CTk):
             args=([], output_size, True, None),   # sort_option=None → preserve order
             daemon=True,
         ).start()
+
+    def _start_load_from_zip(
+        self,
+        zip_path: Path,
+        pending_all: list[tuple[Path, "Face", int, int]],
+        output_size: tuple[int, int],
+        used_face_pct: Optional[float],
+    ):
+        """Load pre-aligned frames from a ZIP archive on a background thread."""
+        self._pending_faces = [(p, f) for p, f, _, _ in pending_all]
+        self._detected_folder = self._folder
+
+        self._align_btn.configure(state="disabled")
+        self._export_btn.configure(state="disabled")
+        self._aligned_frames.clear()
+        self._preview.clear()
+        self._progress.configure(mode="indeterminate")
+        self._progress.start()
+        self._set_status(f"Loading project — reading {len(pending_all)} frame(s)…")
+
+        threading.Thread(
+            target=self._load_zip_worker,
+            args=(zip_path, pending_all, output_size, used_face_pct),
+            daemon=True,
+        ).start()
+
+    def _load_zip_worker(
+        self,
+        zip_path: Path,
+        pending_all: list[tuple[Path, "Face", int, int]],
+        output_size: tuple[int, int],
+        used_face_pct: Optional[float],
+    ):
+        try:
+            frames: list[AlignedFrame] = []
+            skipped = 0
+            n = len(pending_all)
+
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zip_names = set(zf.namelist())
+                for i, (img_path, face, frame_index, face_count) in enumerate(pending_all):
+                    self._set_status(f"Loading frame {i + 1}/{n}…")
+                    frame_name = f"frames/{frame_index:04d}.jpg"
+                    if frame_name not in zip_names:
+                        skipped += 1
+                        continue
+                    buf = np.frombuffer(zf.read(frame_name), dtype=np.uint8)
+                    bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                    if bgr is None:
+                        skipped += 1
+                        continue
+                    frames.append(AlignedFrame(
+                        source_path=img_path,
+                        image=bgr,
+                        face=face,
+                        transform=np.zeros((2, 3), dtype=np.float64),
+                        face_count=face_count,
+                    ))
+
+            self.after(0, lambda: self._align_done(
+                frames, skipped, used_face_pct, output_size
+            ))
+
+        except Exception as exc:
+            def _err(e=exc):
+                self._progress.stop()
+                self._progress.configure(mode="determinate")
+                self._align_btn.configure(state="normal")
+                messagebox.showerror("Load failed", str(e))
+                self._set_status("Load failed.")
+            self.after(0, _err)
 
     def _update_title(self):
         if self._project_path:
@@ -520,6 +669,7 @@ class App(ctk.CTk):
         self._sort_var = ctk.StringVar(value="Date ↑")
         ctk.CTkOptionMenu(
             parent, variable=self._sort_var, values=_SORT_OPTIONS, width=130,
+            command=lambda _: self._on_sort_changed(),
         ).grid(row=0, column=3, padx=(0, 10), pady=(8, 2))
 
         # --- Row 1: settings ---
@@ -540,18 +690,21 @@ class App(ctk.CTk):
         ctk.CTkLabel(r1, text="Hold (s):").grid(row=0, column=col, padx=(0, 2))
         col += 1
         self._hold_var = ctk.StringVar(value="1.5")
+        self._hold_var.trace_add("write", self._update_video_info)
         ctk.CTkEntry(r1, textvariable=self._hold_var, width=52).grid(row=0, column=col, padx=(0, 16))
         col += 1
 
         ctk.CTkLabel(r1, text="Transition (s):").grid(row=0, column=col, padx=(0, 2))
         col += 1
         self._trans_var = ctk.StringVar(value="1.0")
+        self._trans_var.trace_add("write", self._update_video_info)
         ctk.CTkEntry(r1, textvariable=self._trans_var, width=52).grid(row=0, column=col, padx=(0, 16))
         col += 1
 
         ctk.CTkLabel(r1, text="FPS:").grid(row=0, column=col, padx=(0, 2))
         col += 1
         self._fps_var = ctk.StringVar(value="30")
+        self._fps_var.trace_add("write", self._update_video_info)
         ctk.CTkEntry(r1, textvariable=self._fps_var, width=44).grid(row=0, column=col, padx=(0, 16))
         col += 1
 
@@ -613,9 +766,23 @@ class App(ctk.CTk):
         self._status_label = ctk.CTkLabel(parent, text="Ready.", anchor="w")
         self._status_label.grid(row=0, column=0, padx=12, pady=4, sticky="w")
 
-        self._progress = ctk.CTkProgressBar(parent, width=300)
+        self._video_info_label = ctk.CTkLabel(
+            parent, text="", anchor="e", text_color="gray", width=140,
+        )
+        self._video_info_label.grid(row=0, column=1, padx=(0, 8), pady=4)
+
+        self._show_folder_btn = ctk.CTkButton(
+            parent, text="Show in Folder", command=self._show_in_folder,
+            width=130, state="disabled",
+            fg_color="transparent", border_width=1,
+            text_color=("#1f538d", "#4da6ff"),
+            hover_color=("#e0e8f5", "#1e2d40"),
+        )
+        self._show_folder_btn.grid(row=0, column=2, padx=(0, 8), pady=4)
+
+        self._progress = ctk.CTkProgressBar(parent, width=200)
         self._progress.set(0)
-        self._progress.grid(row=0, column=1, padx=(0, 12), pady=4)
+        self._progress.grid(row=0, column=3, padx=(0, 12), pady=4)
 
     # ------------------------------------------------------------------
     # Actions
@@ -630,11 +797,67 @@ class App(ctk.CTk):
         self._aligned_frames.clear()
         self._preview.clear()
         self._export_btn.configure(state="disabled")
-        # Invalidate cached detections — new folder means new images.
         self._pending_faces.clear()
         self._detected_folder = None
         self._face_pct_var.set("")
-        self._set_status("Folder selected. Click 'Align Photos' to process.")
+
+        images = sorted(
+            p for p in self._folder.iterdir()
+            if p.suffix.lower() in _IMAGE_EXTS
+        )
+        if not images:
+            self._set_status("No images found in folder.")
+            return
+
+        sorted_images = [
+            p for p, _ in _sort_images_keyed([(p, None) for p in images], self._sort_var.get())
+        ]
+        token = object()
+        self._raw_preview_token = token
+        self._progress.configure(mode="indeterminate")
+        self._progress.start()
+        self._set_status(f"Loading previews for {len(sorted_images)} photo(s)…")
+        threading.Thread(
+            target=self._load_raw_previews,
+            args=(sorted_images, token),
+            daemon=True,
+        ).start()
+
+    def _load_raw_previews(self, images: list[Path], token: object) -> None:
+        from PIL import Image as _PIL, ImageOps as _IOps
+
+        dummy_face = Face(index=0, bbox=(0, 0, 0, 0), left_eye=(0.0, 0.0), right_eye=(0.0, 0.0))
+        frames: list[AlignedFrame] = []
+
+        for path in images:
+            if token is not self._raw_preview_token:
+                return
+            try:
+                pil = _IOps.exif_transpose(_PIL.open(path).convert("RGB"))
+                pil.thumbnail((240, 240), _PIL.LANCZOS)
+                bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+                frames.append(AlignedFrame(
+                    source_path=path,
+                    image=bgr,
+                    face=dummy_face,
+                    transform=np.zeros((2, 3), dtype=np.float64),
+                    face_count=0,
+                ))
+            except Exception:
+                continue
+
+        def _done(tok=token, fs=frames):
+            if tok is not self._raw_preview_token:
+                return
+            self._progress.stop()
+            self._progress.configure(mode="determinate")
+            self._progress.set(0)
+            self._preview.set_frames(fs)
+            self._set_status(
+                f"{len(fs)} photo(s) ready. Click ‘Align Photos’ to process."
+            )
+
+        self.after(0, _done)
 
     def _start_align(self):
         if not self._folder:
@@ -658,10 +881,12 @@ class App(ctk.CTk):
             bool(self._pending_faces) and self._detected_folder == self._folder
         )
 
+        self._raw_preview_token = object()  # cancel any in-progress raw preview load
+        self._progress.stop()
+        self._progress.configure(mode="determinate")
         self._align_btn.configure(state="disabled")
         self._export_btn.configure(state="disabled")
         self._aligned_frames.clear()
-        self._preview.clear()
         self._progress.set(0)
 
         if can_skip_detection:
@@ -687,6 +912,7 @@ class App(ctk.CTk):
         self._aligner = FaceAligner(output_size=output_size)
 
         skipped = 0
+        face_counts: dict[Path, int] = {}
 
         # --- Phase 1: detect faces (skipped when only Face % changed) ---
         if skip_detection:
@@ -718,6 +944,7 @@ class App(ctk.CTk):
                         skipped += 1
                         continue
 
+                face_counts[path] = len(faces)
                 pending.append((path, chosen))
 
             self._pending_faces = pending
@@ -772,6 +999,7 @@ class App(ctk.CTk):
             self._progress.set(0.5 + (j + 1) / (m * 2))
             try:
                 frame = self._aligner.align(path, face, target_eye_px=target_eye_px)
+                frame.face_count = face_counts.get(path, 1)
                 results.append(frame)
             except Exception as exc:
                 self._set_status(f"Align error {path.name}: {exc}")
@@ -779,6 +1007,17 @@ class App(ctk.CTk):
 
         self.after(0, self._align_done, results, skipped,
                    target_eye_px / output_w * 100, output_size)
+
+    def _on_sort_changed(self) -> None:
+        if not self._pending_faces or not self._aligned_frames:
+            return
+        self._pending_faces = _sort_images_keyed(self._pending_faces, self._sort_var.get())
+        path_to_frame = {f.source_path: f for f in self._aligned_frames}
+        self._aligned_frames = [
+            path_to_frame[p] for p, _ in self._pending_faces if p in path_to_frame
+        ]
+        self._preview.set_frames(self._aligned_frames)
+        self._update_video_info()
 
     def _ask_face_pick(self, path: Path, faces) -> Optional[object]:
         result_holder = [None]
@@ -799,6 +1038,8 @@ class App(ctk.CTk):
         used_face_pct: Optional[float],
         output_size: Optional[tuple[int, int]] = None,
     ):
+        self._progress.stop()
+        self._progress.configure(mode="determinate")
         self._aligned_frames = results
         self._aligned_output_size = output_size
         self._preview.set_frames(results)
@@ -818,6 +1059,7 @@ class App(ctk.CTk):
 
         if results:
             self._export_btn.configure(state="normal")
+        self._update_video_info()
 
     # ------------------------------------------------------------------
     # Export
@@ -827,13 +1069,26 @@ class App(ctk.CTk):
         if not self._aligned_frames:
             return
 
+        if self._last_export_path:
+            default_name = self._last_export_path.stem
+            initial_dir  = str(self._last_export_path.parent)
+        elif self._project_path:
+            default_name = self._project_path.stem
+            initial_dir  = str(self._project_path.parent)
+        else:
+            default_name = ""
+            initial_dir  = ""
+
         out_path = filedialog.asksaveasfilename(
             title="Save MP4",
             defaultextension=".mp4",
             filetypes=[("MP4 video", "*.mp4")],
+            initialfile=default_name,
+            initialdir=initial_dir or None,
         )
         if not out_path:
             return
+        self._last_export_path = Path(out_path)
 
         try:
             fps = int(self._fps_var.get())
@@ -883,6 +1138,30 @@ class App(ctk.CTk):
     def _export_status(self, msg: str):
         self.after(0, lambda: self._set_status(msg))
 
+    def _compute_duration(self) -> str:
+        n = len(self._aligned_frames)
+        if n == 0:
+            return ""
+        try:
+            fps  = int(self._fps_var.get())
+            hold = float(self._hold_var.get())
+            trans = float(self._trans_var.get())
+        except ValueError:
+            return ""
+        if fps <= 0:
+            return ""
+        total = n * hold + max(0, n - 1) * trans
+        m, s = divmod(int(total), 60)
+        return f"{n} photo{'s' if n != 1 else ''} · {m}:{s:02d}"
+
+    def _update_video_info(self, *_):
+        if hasattr(self, "_video_info_label"):
+            self._video_info_label.configure(text=self._compute_duration())
+
+    def _show_in_folder(self):
+        if self._last_export_path and self._last_export_path.exists():
+            subprocess.Popen(["explorer", "/select,", str(self._last_export_path)])
+
     def _export_done(self, error: Optional[Exception]):
         def _on_main_thread():
             self._progress.stop()
@@ -894,6 +1173,7 @@ class App(ctk.CTk):
             else:
                 self._set_status("Export complete!")
                 self._progress.set(1.0)
+                self._show_folder_btn.configure(state="normal")
             self._export_btn.configure(state="normal")
             self._align_btn.configure(state="normal")
 
@@ -982,6 +1262,7 @@ class App(ctk.CTk):
                     target_eye_px = 0.20 * output_size[0]
 
                 frame = self._aligner.align(path, chosen, target_eye_px=target_eye_px)
+                frame.face_count = len(faces)
 
                 def _done():
                     self._aligned_frames[idx] = frame

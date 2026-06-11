@@ -20,7 +20,7 @@ import cv2
 
 from aligner import AlignedFrame
 
-THUMB_SIZE = 120
+THUMB_SIZE = 220
 THUMB_PAD  = 6
 LABEL_H    = 14
 SELECTED_BORDER = 3
@@ -56,6 +56,9 @@ class PreviewStrip(ctk.CTkFrame):
         self._frames: list[AlignedFrame] = []
         # Each entry is (normal_photo, dim_photo) — built once in set_frames().
         self._thumb_cache: list[tuple[ImageTk.PhotoImage, ImageTk.PhotoImage]] = []
+        # Actual (w, h) of each rendered thumbnail (aspect-correct, fits in THUMB_SIZE²).
+        self._thumb_sizes: list[tuple[int, int]] = []
+        self._max_thumb_h: int = THUMB_SIZE
         self._selected: int = -1
         self._resize_job: Optional[str] = None
 
@@ -101,6 +104,8 @@ class PreviewStrip(ctk.CTkFrame):
     def clear(self) -> None:
         self._frames = []
         self._thumb_cache.clear()
+        self._thumb_sizes.clear()
+        self._max_thumb_h = THUMB_SIZE
         self._reset_drag()
         self._canvas.delete("all")
         self._canvas.configure(scrollregion=(0, 0, 0, 0))
@@ -116,15 +121,25 @@ class PreviewStrip(ctk.CTkFrame):
     # ------------------------------------------------------------------
 
     def _build_thumb_cache(self) -> None:
-        self._thumb_cache = [
-            (self._make_thumb(f, dim=False), self._make_thumb(f, dim=True))
-            for f in self._frames
-        ]
+        self._thumb_cache = []
+        self._thumb_sizes = []
+        for f in self._frames:
+            img_h, img_w = f.image.shape[:2]
+            ratio = min(THUMB_SIZE / img_w, THUMB_SIZE / img_h)
+            tw = max(1, round(img_w * ratio))
+            th = max(1, round(img_h * ratio))
+            self._thumb_sizes.append((tw, th))
+            self._thumb_cache.append((
+                self._make_thumb(f, dim=False, size=(tw, th)),
+                self._make_thumb(f, dim=True,  size=(tw, th)),
+            ))
+        self._max_thumb_h = max((th for _, th in self._thumb_sizes), default=THUMB_SIZE)
 
-    def _make_thumb(self, frame: AlignedFrame, dim: bool = False) -> ImageTk.PhotoImage:
+    def _make_thumb(self, frame: AlignedFrame, dim: bool = False,
+                    size: tuple[int, int] = (THUMB_SIZE, THUMB_SIZE)) -> ImageTk.PhotoImage:
         bgr = frame.image
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(rgb).resize((THUMB_SIZE, THUMB_SIZE), Image.LANCZOS)
+        pil = Image.fromarray(rgb).resize(size, Image.LANCZOS)
         if dim:
             pil = ImageEnhance.Brightness(pil).enhance(0.4)
         return ImageTk.PhotoImage(pil)
@@ -140,7 +155,7 @@ class PreviewStrip(ctk.CTkFrame):
         return max(1, (w - THUMB_PAD) // _CELL)
 
     def _row_h(self) -> int:
-        return THUMB_SIZE + THUMB_PAD + LABEL_H
+        return self._max_thumb_h + THUMB_PAD + LABEL_H
 
     def _thumb_pos(self, i: int) -> tuple[int, int]:
         cols = self._cols()
@@ -175,24 +190,38 @@ class PreviewStrip(ctk.CTkFrame):
         canvas_w = max(self._canvas.winfo_width(), cols * _CELL + THUMB_PAD)
         self._canvas.configure(scrollregion=(0, 0, canvas_w, total_h))
 
+        max_th = self._max_thumb_h
+
         for i in range(n):
-            x0, y0 = self._thumb_pos(i)
+            cx, cy = self._thumb_pos(i)          # cell top-left
+            tw, th = self._thumb_sizes[i]
+            ix = cx + (THUMB_SIZE - tw) // 2     # image top-left (centred in cell)
+            iy = cy + (max_th - th) // 2
 
             normal, dim = self._thumb_cache[i]
             thumb = dim if (self._dragging and i == self._drag_src) else normal
-            self._canvas.create_image(x0, y0, anchor="nw", image=thumb)
+            self._canvas.create_image(ix, iy, anchor="nw", image=thumb)
 
             if i == self._selected and not self._dragging:
                 self._canvas.create_rectangle(
-                    x0 - SELECTED_BORDER, y0 - SELECTED_BORDER,
-                    x0 + THUMB_SIZE + SELECTED_BORDER, y0 + THUMB_SIZE + SELECTED_BORDER,
+                    ix - SELECTED_BORDER, iy - SELECTED_BORDER,
+                    ix + tw + SELECTED_BORDER, iy + th + SELECTED_BORDER,
                     outline=MARKER_COLOR, width=SELECTED_BORDER,
                 )
 
             self._canvas.create_text(
-                x0 + THUMB_SIZE // 2, y0 + THUMB_SIZE + 2,
+                cx + THUMB_SIZE // 2, cy + max_th + 2,
                 text=str(i + 1), fill="#aaaaaa", font=("", 9),
             )
+
+            count = self._frames[i].face_count
+            if count > 0:
+                bx = ix + tw - 11
+                by = iy + th - 11
+                r  = 10
+                fill = "#e07020" if count > 1 else "#444444"
+                self._canvas.create_oval(bx - r, by - r, bx + r, by + r, fill=fill, outline="")
+                self._canvas.create_text(bx, by, text=str(count), fill="white", font=("", 9, "bold"))
 
         if self._dragging and 0 <= self._drop_insert <= n:
             ins = self._drop_insert
@@ -205,7 +234,7 @@ class PreviewStrip(ctk.CTkFrame):
                 mx  = THUMB_PAD + (ins % cols) * _CELL - THUMB_PAD // 2
                 my0 = THUMB_PAD + (ins // cols) * row_h
             self._canvas.create_line(
-                mx, my0 - 2, mx, my0 + THUMB_SIZE + 2,
+                mx, my0 - 2, mx, my0 + max_th + 2,
                 fill=MARKER_COLOR, width=3,
             )
 
