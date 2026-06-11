@@ -65,6 +65,7 @@ class AlignedFrame:
     image: np.ndarray       # aligned BGR at output resolution
     face: Face
     transform: np.ndarray   # 2×3 affine matrix
+    face_count: int = 1     # total faces detected in source image
 
 
 def _iou(a: Face, b: Face) -> float:

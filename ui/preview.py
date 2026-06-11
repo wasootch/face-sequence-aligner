@@ -2,7 +2,11 @@
 Wrapping thumbnail grid showing aligned frames.
 
 Each thumbnail is a small square derived from the full-resolution AlignedFrame.
-Click to select; drag to reorder.
+Click to select; drag to reorder; right-click for context menu.
+
+Performance note: thumbnails are pre-rendered into PhotoImage objects when
+set_frames() is called.  _render() only does fast canvas operations after that,
+so resize and reorder are no longer bottlenecks.
 """
 
 from __future__ import annotations
@@ -16,14 +20,14 @@ import cv2
 
 from aligner import AlignedFrame
 
-THUMB_SIZE = 120
+THUMB_SIZE = 220
 THUMB_PAD  = 6
-LABEL_H    = 14   # height reserved below each thumb for the number label
+LABEL_H    = 14
 SELECTED_BORDER = 3
-DRAG_THRESHOLD  = 8   # pixels before drag mode activates
+DRAG_THRESHOLD  = 8
 MARKER_COLOR    = "#4da6ff"
 
-_CELL = THUMB_SIZE + THUMB_PAD   # one grid cell width/height
+_CELL = THUMB_SIZE + THUMB_PAD
 
 
 class PreviewStrip(ctk.CTkFrame):
@@ -31,8 +35,9 @@ class PreviewStrip(ctk.CTkFrame):
     Scrollable wrapping grid of aligned-frame thumbnails.
 
     Callbacks:
-        on_select(idx)               — fired when a thumbnail is clicked
-        on_reorder(old_idx, new_idx) — fired when a drag-drop reorder completes
+        on_select(idx)               — thumbnail clicked
+        on_reorder(old_idx, new_idx) — drag-drop reorder completed
+        on_context(idx, x, y)        — right-click at screen coords (x, y)
     """
 
     def __init__(
@@ -40,21 +45,29 @@ class PreviewStrip(ctk.CTkFrame):
         parent,
         on_select:  Optional[Callable[[int], None]] = None,
         on_reorder: Optional[Callable[[int, int], None]] = None,
+        on_context: Optional[Callable[[int, int, int], None]] = None,
         **kwargs,
     ):
         super().__init__(parent, **kwargs)
         self._on_select  = on_select
         self._on_reorder = on_reorder
+        self._on_context = on_context
+
         self._frames: list[AlignedFrame] = []
-        self._thumb_images: list[ImageTk.PhotoImage] = []
+        # Each entry is (normal_photo, dim_photo) — built once in set_frames().
+        self._thumb_cache: list[tuple[ImageTk.PhotoImage, ImageTk.PhotoImage]] = []
+        # Actual (w, h) of each rendered thumbnail (aspect-correct, fits in THUMB_SIZE²).
+        self._thumb_sizes: list[tuple[int, int]] = []
+        self._max_thumb_h: int = THUMB_SIZE
         self._selected: int = -1
+        self._resize_job: Optional[str] = None
 
         # Drag state
         self._drag_src:     int   = -1
         self._drag_start_x: float = 0.0
         self._drag_start_y: float = 0.0
         self._dragging:     bool  = False
-        self._drop_insert:  int   = -1   # insertion slot (0 … n)
+        self._drop_insert:  int   = -1
 
         self._canvas = ctk.CTkCanvas(
             self,
@@ -68,11 +81,12 @@ class PreviewStrip(ctk.CTkFrame):
         self._canvas.pack(side="left", fill="both", expand=True)
         self._scrollbar.pack(side="right", fill="y")
 
-        self._canvas.bind("<Button-1>",       self._on_press)
-        self._canvas.bind("<B1-Motion>",      self._on_motion)
-        self._canvas.bind("<ButtonRelease-1>", self._on_release)
-        self._canvas.bind("<MouseWheel>",     self._on_wheel)
-        self._canvas.bind("<Configure>",      self._on_resize)
+        self._canvas.bind("<Button-1>",        self._on_press)
+        self._canvas.bind("<B1-Motion>",        self._on_motion)
+        self._canvas.bind("<ButtonRelease-1>",  self._on_release)
+        self._canvas.bind("<Button-3>",         self._on_right_click)
+        self._canvas.bind("<MouseWheel>",       self._on_wheel)
+        self._canvas.bind("<Configure>",        self._on_resize)
 
         self._draw_empty_hint()
 
@@ -84,11 +98,14 @@ class PreviewStrip(ctk.CTkFrame):
         self._frames = list(frames)
         self._selected = -1
         self._reset_drag()
+        self._build_thumb_cache()
         self._render()
 
     def clear(self) -> None:
         self._frames = []
-        self._thumb_images.clear()
+        self._thumb_cache.clear()
+        self._thumb_sizes.clear()
+        self._max_thumb_h = THUMB_SIZE
         self._reset_drag()
         self._canvas.delete("all")
         self._canvas.configure(scrollregion=(0, 0, 0, 0))
@@ -100,28 +117,54 @@ class PreviewStrip(ctk.CTkFrame):
             self._render()
 
     # ------------------------------------------------------------------
+    # Thumbnail cache — only rebuilt when the frame list changes
+    # ------------------------------------------------------------------
+
+    def _build_thumb_cache(self) -> None:
+        self._thumb_cache = []
+        self._thumb_sizes = []
+        for f in self._frames:
+            img_h, img_w = f.image.shape[:2]
+            ratio = min(THUMB_SIZE / img_w, THUMB_SIZE / img_h)
+            tw = max(1, round(img_w * ratio))
+            th = max(1, round(img_h * ratio))
+            self._thumb_sizes.append((tw, th))
+            self._thumb_cache.append((
+                self._make_thumb(f, dim=False, size=(tw, th)),
+                self._make_thumb(f, dim=True,  size=(tw, th)),
+            ))
+        self._max_thumb_h = max((th for _, th in self._thumb_sizes), default=THUMB_SIZE)
+
+    def _make_thumb(self, frame: AlignedFrame, dim: bool = False,
+                    size: tuple[int, int] = (THUMB_SIZE, THUMB_SIZE)) -> ImageTk.PhotoImage:
+        bgr = frame.image
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb).resize(size, Image.LANCZOS)
+        if dim:
+            pil = ImageEnhance.Brightness(pil).enhance(0.4)
+        return ImageTk.PhotoImage(pil)
+
+    # ------------------------------------------------------------------
     # Layout helpers
     # ------------------------------------------------------------------
 
     def _cols(self) -> int:
-        """Number of columns that fit in the current canvas width."""
         w = self._canvas.winfo_width()
         if w < 10:
-            w = 800  # fallback before first layout pass
+            w = 800
         return max(1, (w - THUMB_PAD) // _CELL)
 
     def _row_h(self) -> int:
-        return THUMB_SIZE + THUMB_PAD + LABEL_H
+        return self._max_thumb_h + THUMB_PAD + LABEL_H
 
     def _thumb_pos(self, i: int) -> tuple[int, int]:
-        """Return (x0, y0) canvas origin for thumbnail i."""
         cols = self._cols()
         x0 = THUMB_PAD + (i % cols) * _CELL
         y0 = THUMB_PAD + (i // cols) * self._row_h()
         return x0, y0
 
     # ------------------------------------------------------------------
-    # Rendering
+    # Rendering — fast canvas-only operations using cached PhotoImages
     # ------------------------------------------------------------------
 
     def _draw_empty_hint(self) -> None:
@@ -135,7 +178,6 @@ class PreviewStrip(ctk.CTkFrame):
 
     def _render(self) -> None:
         self._canvas.delete("all")
-        self._thumb_images.clear()
 
         n = len(self._frames)
         if n == 0:
@@ -148,30 +190,42 @@ class PreviewStrip(ctk.CTkFrame):
         canvas_w = max(self._canvas.winfo_width(), cols * _CELL + THUMB_PAD)
         self._canvas.configure(scrollregion=(0, 0, canvas_w, total_h))
 
-        for i, frame in enumerate(self._frames):
-            x0, y0 = self._thumb_pos(i)
+        max_th = self._max_thumb_h
 
-            thumb = self._make_thumb(frame, dim=(self._dragging and i == self._drag_src))
-            self._thumb_images.append(thumb)
-            self._canvas.create_image(x0, y0, anchor="nw", image=thumb)
+        for i in range(n):
+            cx, cy = self._thumb_pos(i)          # cell top-left
+            tw, th = self._thumb_sizes[i]
+            ix = cx + (THUMB_SIZE - tw) // 2     # image top-left (centred in cell)
+            iy = cy + (max_th - th) // 2
+
+            normal, dim = self._thumb_cache[i]
+            thumb = dim if (self._dragging and i == self._drag_src) else normal
+            self._canvas.create_image(ix, iy, anchor="nw", image=thumb)
 
             if i == self._selected and not self._dragging:
                 self._canvas.create_rectangle(
-                    x0 - SELECTED_BORDER, y0 - SELECTED_BORDER,
-                    x0 + THUMB_SIZE + SELECTED_BORDER, y0 + THUMB_SIZE + SELECTED_BORDER,
+                    ix - SELECTED_BORDER, iy - SELECTED_BORDER,
+                    ix + tw + SELECTED_BORDER, iy + th + SELECTED_BORDER,
                     outline=MARKER_COLOR, width=SELECTED_BORDER,
                 )
 
             self._canvas.create_text(
-                x0 + THUMB_SIZE // 2, y0 + THUMB_SIZE + 2,
+                cx + THUMB_SIZE // 2, cy + max_th + 2,
                 text=str(i + 1), fill="#aaaaaa", font=("", 9),
             )
 
-        # Insertion marker: vertical bar on the left edge of the insertion slot
+            count = self._frames[i].face_count
+            if count > 0:
+                bx = ix + tw - 11
+                by = iy + th - 11
+                r  = 10
+                fill = "#e07020" if count > 1 else "#444444"
+                self._canvas.create_oval(bx - r, by - r, bx + r, by + r, fill=fill, outline="")
+                self._canvas.create_text(bx, by, text=str(count), fill="white", font=("", 9, "bold"))
+
         if self._dragging and 0 <= self._drop_insert <= n:
             ins = self._drop_insert
             if ins == n:
-                # After the last item
                 last_col = (n - 1) % cols
                 last_row = (n - 1) // cols
                 mx  = THUMB_PAD + (last_col + 1) * _CELL - THUMB_PAD // 2
@@ -180,24 +234,15 @@ class PreviewStrip(ctk.CTkFrame):
                 mx  = THUMB_PAD + (ins % cols) * _CELL - THUMB_PAD // 2
                 my0 = THUMB_PAD + (ins // cols) * row_h
             self._canvas.create_line(
-                mx, my0 - 2, mx, my0 + THUMB_SIZE + 2,
+                mx, my0 - 2, mx, my0 + max_th + 2,
                 fill=MARKER_COLOR, width=3,
             )
-
-    def _make_thumb(self, frame: AlignedFrame, dim: bool = False) -> ImageTk.PhotoImage:
-        bgr = frame.image
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(rgb).resize((THUMB_SIZE, THUMB_SIZE), Image.LANCZOS)
-        if dim:
-            pil = ImageEnhance.Brightness(pil).enhance(0.4)
-        return ImageTk.PhotoImage(pil)
 
     # ------------------------------------------------------------------
     # Drag-drop helpers
     # ------------------------------------------------------------------
 
     def _idx_at(self, canvas_x: float, canvas_y: float) -> int:
-        """Thumbnail index at canvas coordinates (-1 if none)."""
         cols = self._cols()
         col = int((canvas_x - THUMB_PAD) // _CELL)
         row = int((canvas_y - THUMB_PAD) // self._row_h())
@@ -207,7 +252,6 @@ class PreviewStrip(ctk.CTkFrame):
         return idx if 0 <= idx < len(self._frames) else -1
 
     def _insert_at(self, canvas_x: float, canvas_y: float) -> int:
-        """Insertion slot (0 … n) closest to the given canvas coordinates."""
         cols  = self._cols()
         row_h = self._row_h()
         n     = len(self._frames)
@@ -240,6 +284,8 @@ class PreviewStrip(ctk.CTkFrame):
             return
         cx = self._canvas.canvasx(event.x)
         cy = self._canvas.canvasy(event.y)
+
+        was_dragging = self._dragging
         if not self._dragging:
             dx = cx - self._drag_start_x
             dy = cy - self._drag_start_y
@@ -247,8 +293,11 @@ class PreviewStrip(ctk.CTkFrame):
                 return
             self._dragging = True
 
-        self._drop_insert = self._insert_at(cx, cy)
-        self._render()
+        new_insert = self._insert_at(cx, cy)
+        # Only re-render when the insertion slot changes, or on drag start
+        if not was_dragging or new_insert != self._drop_insert:
+            self._drop_insert = new_insert
+            self._render()
 
     def _on_release(self, event) -> None:
         if self._drag_src < 0:
@@ -275,9 +324,19 @@ class PreviewStrip(ctk.CTkFrame):
         self._reset_drag()
         self._render()
 
+    def _on_right_click(self, event) -> None:
+        cx = self._canvas.canvasx(event.x)
+        cy = self._canvas.canvasy(event.y)
+        idx = self._idx_at(cx, cy)
+        if idx >= 0 and self._on_context:
+            self._on_context(idx, event.x_root, event.y_root)
+
     def _on_wheel(self, event) -> None:
         self._canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
 
     def _on_resize(self, event) -> None:
-        if self._frames:
-            self._render()
+        if not self._frames:
+            return
+        if self._resize_job:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(60, self._render)
